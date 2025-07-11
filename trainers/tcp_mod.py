@@ -21,6 +21,9 @@ import numpy as np
 import copy
 import clip.clip as clip_ori
 
+import loralib as lora
+
+
 
 def load_clip_to_cpu(cfg):
     backbone_name = cfg.MODEL.BACKBONE.NAME
@@ -39,6 +42,68 @@ def load_clip_to_cpu(cfg):
 
     return model
 
+def add_lora_to_customclip(model, r=8, alpha=32, dropout=0.1):
+    """
+    Add lora:
+     - attn.out_proj
+     - mlp.c_fc
+     - mlp.c_proj
+    last half transformer.resblocks in model.image_encoder
+    """
+    resblocks = model.image_encoder.transformer.resblocks
+    n = len(resblocks)
+    start = n // 2
+
+    for i in range(start, n):
+        block = resblocks[i]
+
+        if hasattr(block.attn, "out_proj"):
+            old = block.attn.out_proj
+            lora_proj = lora.Linear(
+                in_features=old.in_features,
+                out_features=old.out_features,
+                r=r,
+                lora_alpha=alpha,
+                lora_dropout=dropout,
+                merge_weights=False
+            )
+            lora_proj.weight.data = old.weight.data.clone()
+            if old.bias is not None:
+                lora_proj.bias.data = old.bias.data.clone()
+            block.attn.out_proj = lora_proj
+
+        if hasattr(block.mlp, "c_fc"):
+            old = block.mlp.c_fc
+            lora_fc = lora.Linear(
+                in_features=old.in_features,
+                out_features=old.out_features,
+                r=r,
+                lora_alpha=alpha,
+                lora_dropout=dropout,
+                merge_weights=False
+            )
+            lora_fc.weight.data = old.weight.data.clone()
+            if old.bias is not None:
+                lora_fc.bias.data = old.bias.data.clone()
+            block.mlp.c_fc = lora_fc
+
+        if hasattr(block.mlp, "c_proj"):
+            old = block.mlp.c_proj
+            lora_proj2 = lora.Linear(
+                in_features=old.in_features,
+                out_features=old.out_features,
+                r=r,
+                lora_alpha=alpha,
+                lora_dropout=dropout,
+                merge_weights=False
+            )
+            lora_proj2.weight.data = old.weight.data.clone()
+            if old.bias is not None:
+                lora_proj2.bias.data = old.bias.data.clone()
+            block.mlp.c_proj = lora_proj2
+
+    print(f"Add LoRA in {n - start} block image_encoder")
+    return model
 
 CUSTOM_TEMPLATES_ori = {
     "OxfordPets": "a photo of a {}, a type of pet.",
@@ -205,6 +270,7 @@ class PromptLearner(nn.Module):
                          ]))
         if cfg.TRAINER.COCOOP.PREC == "fp16":
             self.meta_net.half()
+            
         classnames = [name.replace("_", " ") for name in classnames]
         temp = CUSTOM_TEMPLATES[cfg.DATASET.NAME]
         prompts = [temp.format(c.replace("_", " ")) for c in classnames]
@@ -272,11 +338,11 @@ class CustomCLIP(nn.Module):
     def __init__(self, cfg, classnames, clip_model):
         super().__init__()
         self.prompt_learner = PromptLearner(cfg, classnames, clip_model)
+        self.cross_attn_text_img = Attention(768, 512, n_heads=8)
         self.tokenized_prompts = self.prompt_learner.tokenized_prompts
         self.ori_embedding = self.prompt_learner.text_features
         self.image_encoder = ImageEncoder(clip_model.visual)
         self.text_encoder = TextEncoder(clip_model)
-        self.attention = Attention(768, 512, n_heads=8)
         self.logit_scale = clip_model.logit_scale
         self.dtype = clip_model.dtype
         self.domain_sim = -1
@@ -284,7 +350,7 @@ class CustomCLIP(nn.Module):
         self.weight = cfg.TRAINER.COOP.W
         
         if self.dtype == torch.float16:
-            self.attention.half()
+            self.cross_attn_text_img.half()
     
     def forward(self, image, label=None):
         cls_token, patch_tokens = self.image_encoder(image.type(self.dtype))
@@ -297,7 +363,7 @@ class CustomCLIP(nn.Module):
         cls_token = cls_token / cls_token.norm(dim=-1, keepdim=True)
         patch_tokens = patch_tokens / patch_tokens.norm(dim=-1, keepdim=True)
         
-        atten_features = self.attention(patch_tokens, text_features_old)
+        atten_features = self.cross_attn_text_img(patch_tokens, text_features_old)
         prompts,class_prompt = self.prompt_learner(atten_features)
         text_features = self.text_encoder(prompts, class_prompt, self.weight,tokenized_prompts.detach()) 
         text_features_norm = text_features / text_features.norm(dim=-1, keepdim=True)
@@ -333,17 +399,29 @@ class TCP_MOD(TrainerX):
 
         print("Building custom CLIP")
         self.model = CustomCLIP(cfg, classnames, clip_model)
+        # import pdb; pdb.set_trace()
+        self.model = add_lora_to_customclip(self.model)
         self.w = cfg.TRAINER.COOP.W
 
+        
+        if cfg.TRAINER.COOP.PREC == "fp16":
+            self.model.image_encoder.half()
+            for module in self.model.image_encoder.modules():
+                if isinstance(module, nn.LayerNorm):
+                    module.float()
+        
         print("Turning off gradients in both the image and the text encoder")
+        
+        for _, param in self.model.named_parameters():
+            param.requires_grad_(False)
 
-        name_to_update = "prompt_learner"
-
+        name_to_update = ["prompt_learner", "lora", "cross_attn_text_img"]
         for name, param in self.model.named_parameters():
-            if name_to_update not in name:
-                param.requires_grad_(False)
-            else:
-                print(name)
+            for n2u in name_to_update:
+                if n2u in name:
+                    param.requires_grad_(True)
+                    print(f"Training parameter: {name}")
+                
 
 
         if cfg.MODEL.INIT_WEIGHTS:
@@ -354,6 +432,8 @@ class TCP_MOD(TrainerX):
         self.optim = build_optimizer(self.model.prompt_learner, cfg.OPTIM)
         self.sched = build_lr_scheduler(self.optim, cfg.OPTIM)
         self.register_model("prompt_learner", self.model.prompt_learner, self.optim, self.sched)
+        self.register_model("cross_attn_text_img", self.model.cross_attn_text_img, self.optim, self.sched)
+        self.register_model("image_encoder", self.model.image_encoder, self.optim, self.sched)
         
         self.scaler = GradScaler() if cfg.TRAINER.COOP.PREC == "amp" else None
 
