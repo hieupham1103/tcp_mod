@@ -13,7 +13,7 @@ DATASET=$1
 
 for SEED in 1 2 3
 do
-    bash scripts/train.sh ${DATASET} ${SEED}
+    bash scripts/base2new/train.sh ${DATASET} ${SEED}
 
-    bash scripts/test.sh ${DATASET} ${SEED}
+    bash scripts/base2new/test.sh ${DATASET} ${SEED}
 done
