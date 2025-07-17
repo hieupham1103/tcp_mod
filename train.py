@@ -31,6 +31,7 @@ import trainers.zsclip
 import trainers.prograd
 import trainers.tcp
 import trainers.tcp_mod
+import trainers.tcp_mod_maple
 def print_args(args, cfg):
     print("***************")
     print("** Arguments **")
