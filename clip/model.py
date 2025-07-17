@@ -159,7 +159,12 @@ class LayerNorm(nn.LayerNorm):
 
     def forward(self, x: torch.Tensor):
         orig_type = x.dtype
-        ret = super().forward(x.type(torch.float32))
+        # Convert weight and bias to match the computation dtype
+        weight = self.weight.float() if self.weight is not None else None
+        bias = self.bias.float() if self.bias is not None else None
+        ret = F.layer_norm(
+            x.float(), self.normalized_shape, weight, bias, self.eps
+        )
         return ret.type(orig_type)
 
 
@@ -239,7 +244,7 @@ class ResidualAttentionBlock_MaPLe(nn.Module):
                         prefix = x[0:x.shape[0] - self.compound_prompt_nctx, :, :]
                         # Create/configure learnable tokens of this layer
                         visual_context = compound_prompts_deeper[counter]  # extract the correct index
-                        visual_context = visual_context.expand(x.shape[1], -1, -1).permute(1, 0, 2).half()
+                        visual_context = visual_context.expand(x.shape[1], -1, -1).permute(1, 0, 2).to(x.dtype)
                         # Add the learnable tokens of this layer with the input, by replacing previous
                         # layer learnable tokens
                         x = torch.cat([prefix, visual_context], dim=0)
@@ -256,7 +261,7 @@ class ResidualAttentionBlock_MaPLe(nn.Module):
                         suffix = x[1 + self.compound_prompt_nctx:, :, :]
                         # Create/configure learnable tokens of this layer
                         textual_context = compound_prompts_deeper[counter]
-                        textual_context = textual_context.expand(x.shape[1], -1, -1).permute(1, 0, 2).half()
+                        textual_context = textual_context.expand(x.shape[1], -1, -1).permute(1, 0, 2).to(x.dtype)
                         # Add the learnable tokens of this layer with the input, replaced by previous
                         # layer learnable tokens
                         x = torch.cat([prefix, textual_context, suffix], dim=0)
@@ -283,8 +288,14 @@ class Transformer(nn.Module):
             # Default behavior for TCP or other trainers
             self.resblocks = nn.Sequential(*[ResidualAttentionBlock(width, heads, attn_mask) for _ in range(layers)])
 
-    def forward(self, x: torch.Tensor):
-        return self.resblocks(x)
+    def forward(self, x):
+        # Check if input is a list (for MaPLe) or tensor (for regular use)
+        if isinstance(x, list):
+            # MaPLe mode: x is [tensor, compound_prompts, counter]
+            return self.resblocks(x)
+        else:
+            # Regular mode: x is a tensor
+            return self.resblocks(x)
 
 
 class VisionTransformer(nn.Module):
@@ -356,7 +367,7 @@ class VisionTransformer_MaPLe(nn.Module):
         # After positional embeddings, we will attach prompts with the model, remember only those
         # are trainable parameters here in whole image encoder.
         if self.VPT_shallow:
-            visual_ctx = shared_ctx.expand(x.shape[0], -1, -1).half()
+            visual_ctx = shared_ctx.expand(x.shape[0], -1, -1).to(x.dtype)
             x = torch.cat([x, visual_ctx], dim=1)
         else:
             assert self.prompt_till_layer_visual == 0
@@ -436,7 +447,7 @@ class CLIP(nn.Module):
             heads=transformer_heads,
             attn_mask=self.build_attention_mask(),
             text_layer=True,
-            design_details=design_details
+            design_details=None  # Use regular blocks for standard text encoding
         )
 
         self.vocab_size = vocab_size

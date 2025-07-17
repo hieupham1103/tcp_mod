@@ -1,5 +1,4 @@
 DATA=data/
-TRAINER=TCP_MOD
 WEIGHT=1.0
 
 CFG=vit_b16_ep100_ctxv1
@@ -11,6 +10,7 @@ FOLDER=outputs
 
 DATASET=$1
 SEED=$2
+TRAINER=${3:-"TCP"}
 
 DIR=${FOLDER}/ctx_${NCTX}/base2new/train_base/${DATASET}/shots_${SHOTS}_${WEIGHT}/${TRAINER}/${CFG}/seed${SEED}
 

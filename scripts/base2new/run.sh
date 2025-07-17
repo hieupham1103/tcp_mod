@@ -1,5 +1,4 @@
 DATA=data/
-TRAINER=TCP_MOD_MAPLE
 WEIGHT=1.0
 
 CFG=vit_b16_ep100_ctxv1
@@ -10,10 +9,11 @@ CSC=False  # class-specific context (False or True)
 FOLDER=outputs
 
 DATASET=$1
+TRAINER=${2:-"TCP_MOD_MAPLE"}  # default trainer is tcp_mod_maple
 
-for SEED in 1 2 3
+for SEED in 1
 do
-    bash scripts/base2new/train.sh ${DATASET} ${SEED}
+    bash scripts/base2new/train.sh ${DATASET} ${SEED} ${TRAINER}
 
-    bash scripts/base2new/test.sh ${DATASET} ${SEED}
+    # bash scripts/base2new/test.sh ${DATASET} ${SEED} ${TRAINER}
 done

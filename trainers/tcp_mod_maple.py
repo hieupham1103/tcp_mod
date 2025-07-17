@@ -13,13 +13,12 @@ from dassl.metrics import compute_accuracy
 from dassl.utils import load_pretrained_weights, load_checkpoint
 from dassl.optim import build_optimizer, build_lr_scheduler
 
-from .clip_text import clip
-from .clip_text.simple_tokenizer import SimpleTokenizer as _Tokenizer
+from clip import clip
+from clip.simple_tokenizer import SimpleTokenizer as _Tokenizer
 import tqdm
 _tokenizer = _Tokenizer()
 import numpy as np
 import copy
-import clip.clip as clip_ori
 
 
 
@@ -106,7 +105,19 @@ class ImageEncoder(nn.Module):
         x = self.ln_pre(x)
 
         x = x.permute(1, 0, 2)
-        x = self.transformer(x)
+        # Check if transformer expects list input (MaPLe) or tensor input (regular)
+        if hasattr(self.transformer, 'resblocks') and len(self.transformer.resblocks) > 0:
+            # Check if the first block is a MaPLe block
+            first_block = self.transformer.resblocks[0]
+            if hasattr(first_block, 'compound_prompt_nctx'):
+                # This is a MaPLe transformer, use empty compound prompts
+                x = self.transformer([x, [], 0])[0]
+            else:
+                # Regular transformer
+                x = self.transformer(x)
+        else:
+            # Fallback to regular transformer
+            x = self.transformer(x)
         x = x.permute(1, 0, 2)
 
         cls_token = x[:, 0, :]
@@ -128,6 +139,28 @@ class TextEncoder(nn.Module):
         self.ln_final = clip_model.ln_final
         self.text_projection = clip_model.text_projection
         self.dtype = clip_model.dtype
+        
+        # Create a separate transformer for MaPLe processing
+        design_details = {"trainer": 'TCP_MOD_MaPLe',
+                         "vision_depth": 0,
+                         "language_depth": 0, 
+                         "vision_ctx": 0,
+                         "language_ctx": 0,
+                         "maple_length": 4}  # Default context length
+        
+        from clip.model import Transformer
+        self.maple_transformer = Transformer(
+            width=clip_model.transformer.width,
+            layers=clip_model.transformer.layers,
+            heads=clip_model.transformer.width // 64,
+            attn_mask=clip_model.transformer.resblocks[0].attn_mask if hasattr(clip_model.transformer.resblocks[0], 'attn_mask') else None,
+            text_layer=True,
+            design_details=design_details
+        )
+        
+        # Ensure MaPLe transformer has the same dtype as the original model
+        if self.dtype == torch.float16:
+            self.maple_transformer.half()
 
     def forward(self, prompts, class_feature, weight, tokenized_prompts, compound_prompts_deeper_text=None, flag=False):
         x = prompts + self.positional_embedding.type(self.dtype)
@@ -137,9 +170,9 @@ class TextEncoder(nn.Module):
         else:
             counter=0
             if compound_prompts_deeper_text is not None:
-                # Pass compound prompts for multi-modal prompting
+                # Pass compound prompts for multi-modal prompting using MaPLe transformer
                 combined = [x, compound_prompts_deeper_text, counter]
-                outputs = self.transformer(combined)
+                outputs = self.maple_transformer(combined)
                 x = outputs[0]
             else:
                 # Original TCP behavior
@@ -219,6 +252,11 @@ class PromptLearner(nn.Module):
         # Projection layers for compound prompts
         single_layer = nn.Linear(ctx_dim, 768)
         self.compound_prompt_projections = _get_clones(single_layer, self.compound_prompts_depth - 1)
+        
+        # Ensure compound prompt projections have the same dtype as the model
+        if dtype == torch.float16:
+            for layer in self.compound_prompt_projections:
+                layer.half()
 
         clip_model_ = load_clip_to_cpu(cfg)
         clip_model_.cuda()
