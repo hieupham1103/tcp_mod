@@ -369,7 +369,8 @@ class CLIP(nn.Module):
         vocab_size: int,
         transformer_width: int,
         transformer_heads: int,
-        transformer_layers: int):
+        transformer_layers: int,
+        design_details=None):
         super().__init__()
 
         self.context_length = context_length
@@ -518,7 +519,7 @@ def convert_weights(model: nn.Module):
     model.apply(_convert_weights_to_fp16)
 
 
-def build_model(state_dict: dict):
+def build_model(state_dict: dict, design_details=None):
     vit = "visual.proj" in state_dict
 
     if vit:
@@ -561,7 +562,7 @@ def build_model(state_dict: dict):
 
     model = CLIP(embed_dim, image_resolution, vision_layers, vision_width,
                  vision_patch_size, context_length, vocab_size,
-                 transformer_width, transformer_heads, transformer_layers)
+                 transformer_width, transformer_heads, transformer_layers, design_details)
 
     for key in ["input_resolution", "context_length", "vocab_size"]:
         if key in state_dict:

@@ -1,5 +1,6 @@
 from collections import OrderedDict
 from typing import Tuple, Union
+import inspect
 
 import numpy as np
 import torch
@@ -197,6 +198,54 @@ class ResidualAttentionBlock(nn.Module):
         return x
 
 
+class ResidualAttentionBlock_MMA(nn.Module):
+    def __init__(self, d_model: int, n_head: int, attn_mask: torch.Tensor = None, text_layer=False, layer_idx=0):
+        super().__init__()
+
+        self.attn = nn.MultiheadAttention(d_model, n_head)
+        self.ln_1 = LayerNorm(d_model)
+        self.mlp = nn.Sequential(OrderedDict([
+            ("c_fc", nn.Linear(d_model, d_model * 4)),
+            ("gelu", QuickGELU()),
+            ("c_proj", nn.Linear(d_model * 4, d_model))
+        ]))
+        self.ln_2 = LayerNorm(d_model)
+        self.attn_mask = attn_mask
+        self.text_layer = text_layer
+        self.layer_idx = layer_idx
+
+    def attention(self, x: torch.Tensor):
+        self.attn_mask = self.attn_mask.to(dtype=x.dtype, device=x.device) if self.attn_mask is not None else None
+        return self.attn(x, x, x, need_weights=False, attn_mask=self.attn_mask)[0]
+
+    def forward(self, x: torch.Tensor, adapter_func=None):
+        # Apply attention
+        x = x + self.attention(self.ln_1(x))
+        
+        # Apply MLP
+        mlp_out = self.mlp(self.ln_2(x))
+        
+        # Apply adapter if provided
+        if adapter_func is not None:
+            adapter, shared_adapter, adapter_scale = adapter_func(self.layer_idx)
+            if adapter is not None:
+                if hasattr(adapter, 'down') and hasattr(adapter, 'up'):
+                    # Two-layer adapter
+                    adapted = adapter.down(mlp_out)
+                    if shared_adapter is not None:
+                        adapted = shared_adapter(adapted)
+                    adapted = adapter.up(adapted)
+                else:
+                    # Single-layer adapter
+                    adapted = adapter(mlp_out)
+                    if shared_adapter is not None:
+                        adapted = shared_adapter(adapted)
+                mlp_out = mlp_out + adapter_scale * adapted
+        
+        x = x + mlp_out
+        return x
+
+
 class ResidualAttentionBlock_MaPLe(nn.Module):
     def __init__(self, d_model: int, n_head: int, attn_mask: torch.Tensor = None, design_details=None,
                  text_layer=False, i=0):
@@ -284,15 +333,27 @@ class Transformer(nn.Module):
             self.resblocks = nn.Sequential(
                 *[ResidualAttentionBlock_MaPLe(width, heads, attn_mask, design_details, text_layer, i)
                   for i in range(layers)])
+        elif current_trainer == 'TCP_MOD_MMA':
+            self.resblocks = nn.Sequential(
+                *[ResidualAttentionBlock_MMA(width, heads, attn_mask, text_layer, i)
+                  for i in range(layers)])
         else:
             # Default behavior for TCP or other trainers
             self.resblocks = nn.Sequential(*[ResidualAttentionBlock(width, heads, attn_mask) for _ in range(layers)])
 
-    def forward(self, x):
+    def forward(self, x, adapter_func=None):
         # Check if input is a list (for MaPLe) or tensor (for regular use)
         if isinstance(x, list):
             # MaPLe mode: x is [tensor, compound_prompts, counter]
             return self.resblocks(x)
+        elif adapter_func is not None:
+            # MMA mode: apply adapters
+            for block in self.resblocks:
+                if hasattr(block, 'forward') and hasattr(block, 'layer_idx'):
+                    x = block(x, adapter_func)
+                else:
+                    x = block(x)
+            return x
         else:
             # Regular mode: x is a tensor
             return self.resblocks(x)
@@ -325,6 +386,44 @@ class VisionTransformer(nn.Module):
 
         x = x.permute(1, 0, 2)  # NLD -> LND
         x = self.transformer(x)
+        x = x.permute(1, 0, 2)  # LND -> NLD
+
+        x = self.ln_post(x[:, 0, :])
+
+        if self.proj is not None:
+            x = x @ self.proj
+
+        return x
+
+
+class VisionTransformer_MMA(nn.Module):
+    def __init__(self, input_resolution: int, patch_size: int, width: int, layers: int, heads: int, output_dim: int,
+                 design_details):
+        super().__init__()
+        self.input_resolution = input_resolution
+        self.output_dim = output_dim
+        self.conv1 = nn.Conv2d(in_channels=3, out_channels=width, kernel_size=patch_size, stride=patch_size, bias=False)
+
+        scale = width ** -0.5
+        self.class_embedding = nn.Parameter(scale * torch.randn(width))
+        self.positional_embedding = nn.Parameter(scale * torch.randn((input_resolution // patch_size) ** 2 + 1, width))
+        self.ln_pre = LayerNorm(width)
+
+        self.transformer = Transformer(width, layers, heads, design_details=design_details)
+
+        self.ln_post = LayerNorm(width)
+        self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
+
+    def forward(self, x: torch.Tensor, visual_adapter_func=None):
+        x = self.conv1(x)  # shape = [*, width, grid, grid]
+        x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
+        x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
+        x = torch.cat([self.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device), x], dim=1)  # shape = [*, grid ** 2 + 1, width]
+        x = x + self.positional_embedding.to(x.dtype)
+        x = self.ln_pre(x)
+
+        x = x.permute(1, 0, 2)  # NLD -> LND
+        x = self.transformer(x, visual_adapter_func)
         x = x.permute(1, 0, 2)  # LND -> NLD
 
         x = self.ln_post(x[:, 0, :])
@@ -431,6 +530,16 @@ class CLIP(nn.Module):
                     output_dim=embed_dim,
                     design_details=design_details
                 )
+            elif trainer == "TCP_MOD_MMA":
+                self.visual = VisionTransformer_MMA(
+                    input_resolution=image_resolution,
+                    patch_size=vision_patch_size,
+                    width=vision_width,
+                    layers=vision_layers,
+                    heads=vision_heads,
+                    output_dim=embed_dim,
+                    design_details=design_details
+                )
             else:
                 self.visual = VisionTransformer(
                     input_resolution=image_resolution,
@@ -447,7 +556,7 @@ class CLIP(nn.Module):
             heads=transformer_heads,
             attn_mask=self.build_attention_mask(),
             text_layer=True,
-            design_details=None  # Use regular blocks for standard text encoding
+            design_details=design_details  # Pass design_details for MMA text encoder
         )
 
         self.vocab_size = vocab_size
@@ -501,15 +610,20 @@ class CLIP(nn.Module):
     def dtype(self):
         return self.visual.conv1.weight.dtype
 
-    def encode_image(self, image):
-        return self.visual(image.type(self.dtype))
+    def encode_image(self, image, visual_adapter_func=None):
+        if hasattr(self.visual, 'forward') and len(inspect.signature(self.visual.forward).parameters) > 1:
+            # VisionTransformer_MMA case
+            return self.visual(image.type(self.dtype), visual_adapter_func)
+        else:
+            # Regular VisionTransformer or VisionTransformer_MaPLe case
+            return self.visual(image.type(self.dtype))
 
-    def encode_text(self, text):
+    def encode_text(self, text, text_adapter_func=None):
         x = self.token_embedding(text).type(self.dtype)  # [batch_size, n_ctx, d_model]
 
         x = x + self.positional_embedding.type(self.dtype)
         x = x.permute(1, 0, 2)  # NLD -> LND
-        x = self.transformer(x)
+        x = self.transformer(x, text_adapter_func)
         x = x.permute(1, 0, 2)  # LND -> NLD
         x = self.ln_final(x).type(self.dtype)
 

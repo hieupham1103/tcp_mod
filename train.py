@@ -32,6 +32,8 @@ import trainers.prograd
 import trainers.tcp
 import trainers.tcp_mod
 import trainers.tcp_mod_maple
+import trainers.tcp_mod_mma
+
 def print_args(args, cfg):
     print("***************")
     print("** Arguments **")
@@ -104,6 +106,13 @@ def extend_cfg(cfg):
     cfg.TRAINER.COCOOP.N_CTX = 16  # number of context vectors
     cfg.TRAINER.COCOOP.CTX_INIT = False  # initialization words
     cfg.TRAINER.COCOOP.PREC = "fp16"  # fp16, fp32, amp
+
+    cfg.TRAINER.TCP_MOD_MMA = CN()
+    cfg.TRAINER.TCP_MOD_MMA.ADAPTER_START = 0  # starting layer for adapters
+    cfg.TRAINER.TCP_MOD_MMA.ADAPTER_END = 11  # ending layer for adapters
+    cfg.TRAINER.TCP_MOD_MMA.ADAPTER_DIM = 64  # adapter dimension
+    cfg.TRAINER.TCP_MOD_MMA.ADAPTER_SCALE = 1.0  # adapter scaling factor
+    cfg.TRAINER.TCP_MOD_MMA.TEXT_CTX_INIT = "a photo of a"  # text context initialization
 
     cfg.DATASET.SUBSAMPLE_CLASSES = "all"  # all, base or new
     """

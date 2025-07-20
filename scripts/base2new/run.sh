@@ -9,7 +9,7 @@ CSC=False  # class-specific context (False or True)
 FOLDER=outputs
 
 DATASET=$1
-TRAINER=${2:-"TCP_MOD_MAPLE"}  # default trainer is tcp_mod_maple
+TRAINER=${2:-"TCP_MOD_MMA"}  # default trainer is tcp_mod_maple
 
 for SEED in 1 2 3
 do
