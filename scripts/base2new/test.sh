@@ -1,5 +1,4 @@
 DATA=data/
-TRAINER=TCP_MOD
 WEIGHT=1.0
 
 CFG=vit_b16_ep100_ctxv1
@@ -14,6 +13,7 @@ SUB=new
 
 DATASET=$1
 SEED=$2
+TRAINER=${3:-"TCP"}
 
 
 COMMON_DIR=${DATASET}/shots_${SHOTS}_${WEIGHT}/${TRAINER}/${CFG}/seed${SEED}

@@ -31,6 +31,8 @@ import trainers.zsclip
 import trainers.prograd
 import trainers.tcp
 import trainers.tcp_mod
+import trainers.tcp_mod_mma
+
 def print_args(args, cfg):
     print("***************")
     print("** Arguments **")
@@ -103,6 +105,16 @@ def extend_cfg(cfg):
     cfg.TRAINER.COCOOP.N_CTX = 16  # number of context vectors
     cfg.TRAINER.COCOOP.CTX_INIT = False  # initialization words
     cfg.TRAINER.COCOOP.PREC = "fp16"  # fp16, fp32, amp
+
+    # Add TCP_MOD_MMA configuration
+    cfg.TRAINER.TCP_MOD_MMA = CN()
+    cfg.TRAINER.TCP_MOD_MMA.USE_ADAPTERS = True
+    cfg.TRAINER.TCP_MOD_MMA.ADAPTER_START = 6
+    cfg.TRAINER.TCP_MOD_MMA.ADAPTER_END = 11
+    cfg.TRAINER.TCP_MOD_MMA.ADAPTER_DIM = 64
+    cfg.TRAINER.TCP_MOD_MMA.ADAPTER_SCALE = 0.5
+    cfg.TRAINER.TCP_MOD_MMA.TEXT_CTX_INIT = "a photo of a"
+    cfg.TRAINER.TCP_MOD_MMA.PREC = "fp16"
 
     cfg.DATASET.SUBSAMPLE_CLASSES = "all"  # all, base or new
     """

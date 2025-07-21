@@ -1,10 +1,17 @@
 from collections import OrderedDict
-from typing import Tuple, Union
+from typing import Tuple, Union, List
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
+
+
+def gradient_scale_layer(x, scale):
+    """Gradient scaling layer."""
+    y_out = x
+    y_grad = x * scale
+    return (y_out - y_grad).detach() + y_grad
 
 
 class Bottleneck(nn.Module):
@@ -224,25 +231,8 @@ class ResidualAttentionBlock(nn.Module):
         return x
 
 
-class Transformer(nn.Module):
-    def __init__(self,
-                 width: int,
-                 layers: int,
-                 heads: int,
-                 attn_mask: torch.Tensor = None):
-        super().__init__()
-        self.width = width
-        self.layers = layers
-        self.resblocks = nn.Sequential(*[
-            ResidualAttentionBlock(width, heads, attn_mask)
-            for _ in range(layers)
-        ])
-
-    def forward(self, x: torch.Tensor):
-        return self.resblocks(x)
-
-class ResidualAttentionBlock_MaPLe(nn.Module):
-    def __init__(self, d_model: int, n_head: int, attn_mask: torch.Tensor = None):
+class ModifiedResidualAttentionBlock(nn.Module):
+    def __init__(self, d_model: int, n_head: int, layer_index: int, attn_mask: torch.Tensor = None):
         super().__init__()
 
         self.attn = nn.MultiheadAttention(d_model, n_head)
@@ -254,37 +244,164 @@ class ResidualAttentionBlock_MaPLe(nn.Module):
         ]))
         self.ln_2 = LayerNorm(d_model)
         self.attn_mask = attn_mask
+        self.layer_index = layer_index
+
+    def attention(self, x: torch.Tensor):
+        self.attn_mask = self.attn_mask.to(dtype=x.dtype, device=x.device) if self.attn_mask is not None else None
+        return self.attn(x, x, x, need_weights=False, attn_mask=self.attn_mask)[0]
+    
+    def forward(self, x):
+        if isinstance(x, List):
+            adapter_func = x[1]
+            x = x[0]
+            seq_adapter, shared_adapter, scale = adapter_func(self.layer_index)
+            if seq_adapter is not None:
+                y = gradient_scale_layer(x, scale)
+                y = self.ln_1(y)
+                y = seq_adapter.down(y)
+                if shared_adapter is not None:
+                    y = shared_adapter(y)
+                y = seq_adapter.up(y) * scale
+                y = gradient_scale_layer(y, 1.0 / scale)
+            else:
+                y = 0
+            x = x + self.attention(self.ln_1(x))
+            x = x + self.mlp(self.ln_2(x)) + y
+            return [x, adapter_func]
+        else:
+            x = x + self.attention(self.ln_1(x))
+            x = x + self.mlp(self.ln_2(x))
+            return x
+
+
+class Transformer(nn.Module):
+    def __init__(self,
+                 width: int,
+                 layers: int,
+                 heads: int,
+                 attn_mask: torch.Tensor = None):
+        super().__init__()
+        self.width = width
+        self.layers = layers
+        self.resblocks = nn.Sequential(*[
+            ModifiedResidualAttentionBlock(width, heads, index+1, attn_mask)
+            for index in range(layers)
+        ])
+
+    def forward(self, x: torch.Tensor):
+        y = self.resblocks(x)
+        if isinstance(y, List):
+            return y[0]
+        else:
+            return y
+
+class ResidualAttentionBlock_MaPLe(nn.Module):
+    def __init__(self, d_model: int, n_head: int, layer_index: int = 0, attn_mask: torch.Tensor = None):
+        super().__init__()
+
+        self.attn = nn.MultiheadAttention(d_model, n_head)
+        self.ln_1 = LayerNorm(d_model)
+        self.mlp = nn.Sequential(OrderedDict([
+            ("c_fc", nn.Linear(d_model, d_model * 4)),
+            ("gelu", QuickGELU()),
+            ("c_proj", nn.Linear(d_model * 4, d_model))
+        ]))
+        self.ln_2 = LayerNorm(d_model)
+        self.attn_mask = attn_mask
+        self.layer_index = layer_index
 
     def attention(self, x: torch.Tensor):
         self.attn_mask = self.attn_mask.to(dtype=x.dtype, device=x.device) if self.attn_mask is not None else None
         return self.attn(x, x, x, need_weights=False, attn_mask=self.attn_mask)[0]
 
     def forward(self, inputs):
-        if len(inputs)==4:
-            x = inputs[0]
-            compound_prompts_deeper = inputs[1]
-            weight = inputs[2]
-            counter = inputs[3]
-            layers=[8]
-            weights=[1.0]
-            if counter in layers:
-                ind = layers.index(counter)
-                textual_context = compound_prompts_deeper.permute(1,0,2)
-                n_ctx=textual_context.shape[0]
-                prefix = x[:1, :, :]
-                suffix = x[1+n_ctx:, :, :]
-                midfix = x[1:1+n_ctx,:,:]
-                weight = weights[ind]
-                x = torch.cat([prefix,weight*textual_context+(1-weight)*midfix,suffix], dim=0)
-            counter += 1
-            x = x + self.attention(self.ln_1(x))
-            x = x + self.mlp(self.ln_2(x))
-            return [x, compound_prompts_deeper, weight,counter]  # return again as a list, so that nn.seq can work
+        if isinstance(inputs, list) and len(inputs) >= 4:
+            # Check if this is TCP mode with adapters
+            if len(inputs) >= 5:
+                x = inputs[0]
+                compound_prompts_deeper = inputs[1]
+                weight = inputs[2]
+                counter = inputs[3]
+                adapter_func = inputs[4]
+                
+                # Apply TCP prompt insertion
+                layers=[8]
+                weights=[1.0]
+                if counter in layers:
+                    ind = layers.index(counter)
+                    textual_context = compound_prompts_deeper.permute(1,0,2)
+                    n_ctx=textual_context.shape[0]
+                    prefix = x[:1, :, :]
+                    suffix = x[1+n_ctx:, :, :]
+                    midfix = x[1:1+n_ctx,:,:]
+                    weight = weights[ind]
+                    x = torch.cat([prefix,weight*textual_context+(1-weight)*midfix,suffix], dim=0)
+                counter += 1
+                
+                # Apply adapter if available
+                seq_adapter, shared_adapter, scale = adapter_func(self.layer_index)
+                if seq_adapter is not None:
+                    y = gradient_scale_layer(x, scale)
+                    y = self.ln_1(y)
+                    y = seq_adapter.down(y)
+                    if shared_adapter is not None:
+                        y = shared_adapter(y)
+                    y = seq_adapter.up(y) * scale
+                    y = gradient_scale_layer(y, 1.0 / scale)
+                else:
+                    y = 0
+                    
+                x = x + self.attention(self.ln_1(x))
+                x = x + self.mlp(self.ln_2(x)) + y
+                return [x, compound_prompts_deeper, weight, counter, adapter_func]
+                
+            elif len(inputs) == 4:
+                # Original TCP mode without adapters
+                x = inputs[0]
+                compound_prompts_deeper = inputs[1]
+                weight = inputs[2]
+                counter = inputs[3]
+                layers=[8]
+                weights=[1.0]
+                if counter in layers:
+                    ind = layers.index(counter)
+                    textual_context = compound_prompts_deeper.permute(1,0,2)
+                    n_ctx=textual_context.shape[0]
+                    prefix = x[:1, :, :]
+                    suffix = x[1+n_ctx:, :, :]
+                    midfix = x[1:1+n_ctx,:,:]
+                    weight = weights[ind]
+                    x = torch.cat([prefix,weight*textual_context+(1-weight)*midfix,suffix], dim=0)
+                counter += 1
+                x = x + self.attention(self.ln_1(x))
+                x = x + self.mlp(self.ln_2(x))
+                return [x, compound_prompts_deeper, weight, counter]
         else:
-            x = inputs
-            x = x + self.attention(self.ln_1(x))
-            x = x + self.mlp(self.ln_2(x))
-            return x
+            # MMA adapter mode or standard mode
+            if isinstance(inputs, List):
+                adapter_func = inputs[1]
+                x = inputs[0]
+                
+                seq_adapter, shared_adapter, scale = adapter_func(self.layer_index)
+                if seq_adapter is not None:
+                    y = gradient_scale_layer(x, scale)
+                    y = self.ln_1(y)
+                    y = seq_adapter.down(y)
+                    if shared_adapter is not None:
+                        y = shared_adapter(y)
+                    y = seq_adapter.up(y) * scale
+                    y = gradient_scale_layer(y, 1.0 / scale)
+                else:
+                    y = 0
+                x = x + self.attention(self.ln_1(x))
+                x = x + self.mlp(self.ln_2(x)) + y
+                return [x, adapter_func]
+            else:
+                # Standard mode
+                x = inputs
+                x = x + self.attention(self.ln_1(x))
+                x = x + self.mlp(self.ln_2(x))
+                return x
 
 
 
@@ -299,12 +416,16 @@ class TextTransformer(nn.Module):
         self.width = width
         self.layers = layers
         self.resblocks = nn.Sequential(*[
-            ResidualAttentionBlock_MaPLe(width, heads, attn_mask)
-            for _ in range(layers)
+            ResidualAttentionBlock_MaPLe(width, heads, layer_index=i+1, attn_mask=attn_mask)
+            for i in range(layers)
         ])
 
     def forward(self, x: torch.Tensor):
-        return self.resblocks(x)
+        y = self.resblocks(x)
+        if isinstance(y, List):
+            return y[0]
+        else:
+            return y
 
 
 class VisionTransformer(nn.Module):
@@ -331,6 +452,12 @@ class VisionTransformer(nn.Module):
         self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
 
     def forward(self, x: torch.Tensor):
+        if isinstance(x, List):
+            adapter_func = x[1]
+            x = x[0]
+        else:
+            adapter_func = None
+
         x = self.conv1(x)  # shape = [*, width, grid, grid]
         x = x.reshape(x.shape[0], x.shape[1],
                       -1)  # shape = [*, width, grid ** 2]
@@ -341,10 +468,28 @@ class VisionTransformer(nn.Module):
         ],
                       dim=1)  # shape = [*, grid ** 2 + 1, width]
         x = x + self.positional_embedding.to(x.dtype)
-        x = self.ln_pre(x)
+
+        if adapter_func is not None:
+            seq_adapter, shared_adapter, scale = adapter_func(0)
+            if seq_adapter is not None:
+                y = self.ln_pre(x)
+                y = seq_adapter.down(y)
+                if shared_adapter is not None:
+                    y = shared_adapter(y)
+                y = seq_adapter.up(y) * scale
+            else:
+                y = 0
+            x = self.ln_pre(x) + y
+        else:
+            x = self.ln_pre(x)
 
         x = x.permute(1, 0, 2)  # NLD -> LND
-        x = self.transformer(x)
+        
+        if adapter_func is not None:
+            x = self.transformer([x, adapter_func])
+        else:
+            x = self.transformer(x)
+            
         x = x.permute(1, 0, 2)  # LND -> NLD
 
         x = self.ln_post(x[:, 0, :])
@@ -369,7 +514,10 @@ class CLIP(nn.Module):
         vocab_size: int,
         transformer_width: int,
         transformer_heads: int,
-        transformer_layers: int):
+        transformer_layers: int,
+        design_details = None
+        ):
+        
         super().__init__()
 
         self.context_length = context_length
