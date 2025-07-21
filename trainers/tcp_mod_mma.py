@@ -271,7 +271,6 @@ class AdapterLearner(nn.Module):
             for m in adapter.modules():
                 if hasattr(m, 'half'):
                     m.half()
-    
         return adapter
     
     def forward(self):

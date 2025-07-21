@@ -43,12 +43,12 @@ TRAINER:
     USE_ADAPTERS: true
     
     # Adapter settings (applies to both text and visual encoders)
-    ADAPTER_START: 6         # Start applying adapters from layer 6
-    ADAPTER_END: 11          # End applying adapters at layer 11 (ViT-B/16 has 12 layers, 0-11)
+    ADAPTER_START: 8         # Start applying adapters from layer 6
+    ADAPTER_END: 12          # End applying adapters at layer 11 (ViT-B/16 has 12 layers, 0-11)
     
     # Adapter architecture settings
-    ADAPTER_DIM: 64          # Adapter bottleneck dimension
-    ADAPTER_SCALE: 0.5       # Adapter scaling factor
+    ADAPTER_DIM: 32          # Adapter bottleneck dimension
+    ADAPTER_SCALE: 0.001      # Adapter scaling factor
     
     # Text context initialization for adapters
     TEXT_CTX_INIT: "a photo of a"
