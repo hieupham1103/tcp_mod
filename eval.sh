@@ -1,6 +1,6 @@
 #!/bin/bash
 
-TRAINER=TCP_MOD
+TRAINER=TCP_MOD_MAPLE
 
 for DATASET in dtd
 do
