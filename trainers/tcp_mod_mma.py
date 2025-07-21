@@ -603,6 +603,19 @@ class TCP_MOD_MMA(TrainerX):
 
             if "token_midfix" in state_dict:
                 del state_dict["token_midfix"]
+                
+            # Ignore class-dependent parameters for AdapterLearner
+            if name == "adapter_learner":
+                if "token_embedding" in state_dict:
+                    del state_dict["token_embedding"]
+                if "tokenized_prompts" in state_dict:
+                    del state_dict["tokenized_prompts"]
+                    
+            # Ignore class-dependent parameters for PromptLearner
+            if name == "prompt_learner":
+                if "text_features" in state_dict:
+                    del state_dict["text_features"]
+                    
             print("Loading weights to {} " 'from "{}" (epoch = {})'.format(name, model_path, epoch))
             # set strict=False
             self._models[name].load_state_dict(state_dict, strict=False)
