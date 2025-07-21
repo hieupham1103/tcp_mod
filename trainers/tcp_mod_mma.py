@@ -344,7 +344,7 @@ class PromptLearner(nn.Module):
                          ("relu", QuickGELU()),
                          ("linear2", nn.Linear(vis_dim // 4, 4*ctx_dim,bias=True))
                          ]))
-        if cfg.TRAINER.COCOOP.PREC == "fp16":
+        if cfg.TRAINER.TCP_MOD_MMA.PREC == "fp16":
             self.meta_net.half()
             
         classnames = [name.replace("_", " ") for name in classnames]
@@ -472,7 +472,7 @@ class CustomCLIP(nn.Module):
 class TCP_MOD_MMA(TrainerX):
 
     def check_cfg(self, cfg):
-        assert cfg.TRAINER.COOP.PREC in ["fp16", "fp32", "amp"]
+        assert cfg.TRAINER.TCP_MOD_MMA.PREC in ["fp16", "fp32", "amp"]
 
     def build_model(self):
         cfg = self.cfg
@@ -482,7 +482,7 @@ class TCP_MOD_MMA(TrainerX):
         print(f"Loading CLIP (backbone: {cfg.MODEL.BACKBONE.NAME})")
         clip_model = load_clip_to_cpu(cfg)
         
-        if cfg.TRAINER.COOP.PREC == "fp32" or cfg.TRAINER.COOP.PREC == "amp":
+        if cfg.TRAINER.TCP_MOD_MMA.PREC == "fp32" or cfg.TRAINER.TCP_MOD_MMA.PREC == "amp":
             # CLIP's default precision is fp16
             clip_model.float()
 
@@ -525,7 +525,7 @@ class TCP_MOD_MMA(TrainerX):
         self.register_model("cross_attn_text_img", self.model.cross_attn_text_img, self.optim, self.sched)
         self.register_model("adapter_learner", self.model.adapter_learner, self.optim, self.sched)
         
-        self.scaler = GradScaler() if cfg.TRAINER.COOP.PREC == "amp" else None
+        self.scaler = GradScaler() if cfg.TRAINER.TCP_MOD_MMA.PREC == "amp" else None
 
         # Note that multi-gpu training could be slow because CLIP's size is
         # big, which slows down the copy operation in DataParallel
@@ -537,7 +537,7 @@ class TCP_MOD_MMA(TrainerX):
 
     def forward_backward(self, batch):
         image, label = self.parse_batch_train(batch)
-        prec = self.cfg.TRAINER.COOP.PREC
+        prec = self.cfg.TRAINER.TCP_MOD_MMA.PREC
         if prec == "amp":
             with autocast():
                 output = self.model(image)
